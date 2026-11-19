@@ -66,6 +66,16 @@
     return /^(test-|pre-)?huxuan\.qq\.com$/.test(host);
   }
 
+  /**
+   * 从互选官网 URL 路径中提取用户 UID
+   * 示例：/trade/ai_selection/95918?session=xxx → "95918"
+   * 路径格式：/trade/<module>/<uid>
+   */
+  function extractUidFromUrl(path = pathname) {
+    const match = path.match(/^\/trade\/(?!free\b)[^/]+\/(\d+)/);
+    return match ? match[1] : '';
+  }
+
   function encode(str) {
     return btoa(
       Array.from(new TextEncoder().encode(str), (b) =>
@@ -822,6 +832,13 @@
 
     // 根据域名和路径执行对应阶段逻辑
     if (isHuxuanDomain()) {
+      // 从 URL 提取 UID，若与配置不同则永久更新配置
+      const urlUid = extractUidFromUrl();
+      if (urlUid && urlUid !== config.accountId) {
+        GM_setValue(CONFIG_KEYS.ACCOUNT_ID, urlUid);
+        log('从 URL 检测到新的目标 UID，已更新配置:', config.accountId, '→', urlUid);
+      }
+
       await handleHuxuanHome();
       setupAutoCheck();
     } else if (hostname === 'sso.e.qq.com' || hostname === 'tsso.e.qq.com') {
