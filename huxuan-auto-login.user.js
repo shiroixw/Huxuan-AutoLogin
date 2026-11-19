@@ -2,8 +2,8 @@
 // @name         互选官网自动登录
 // @namespace    https://huxuan.qq.com/
 // @icon         https://file.daihuo.qq.com/fe_free_trade/favicon.png
-// @version      1.0.9
-// @description  自动完成互选官网的 QQ 密码登录流程，支持配置账号、密码和目标账户 ID
+// @version      1.1.0
+// @description  自动完成互选官网的 QQ 密码登录流程，支持配置账号、密码和目标账户 ID（兼容新版 /login/list 中转页）
 // @author       Huxuan AutoLogin
 // @homepageURL  https://github.com/xiaowulang-turbo/Huxuan-AutoLogin
 // @supportURL   https://github.com/xiaowulang-turbo/Huxuan-AutoLogin/issues
@@ -599,7 +599,7 @@
     }
   }
 
-  // 阶段 4：账户选择页 - 搜索并登录
+  // 阶段 4a：旧版账户选择页（/login/sportal）- 搜索并登录，保留作兜底
   async function handleAccountSelect() {
     if (!pathname.startsWith('/login/sportal')) return;
 
@@ -654,6 +654,95 @@
     } catch (e) {
       log('账户选择失败:', e.message);
     }
+  }
+
+  // 阶段 4b：新版 SSO 账号列表页（/login/list）- 搜索并登录
+  // 新版页面结构：输入框 #search（仅监听 keypress Enter 触发搜索）→ 结果表格 #search_login_body
+  // 每行 <tr onclick="login('<accountId>','<accountType>')">，无 a 标签，只能通过点击行触发
+  const ACCOUNT_ROW_SELECTOR = '#search_login_body tr';
+
+  async function waitForAccountRow(accountId, timeout = 8000) {
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      const rows = document.querySelectorAll(ACCOUNT_ROW_SELECTOR);
+      for (const row of rows) {
+        const idCell = row.cells && row.cells[0];
+        if (!idCell) continue;
+        const text = idCell.textContent.trim();
+        if (text === accountId) return row;
+        // 搜索无结果时页面会渲染一行「查无此账号」占位
+        if (text.includes('查无此账号')) {
+          throw new Error(`账号列表中查无此账号: ${accountId}`);
+        }
+      }
+      await sleep(200);
+    }
+
+    throw new Error(`等待账号 "${accountId}" 搜索结果超时 (${timeout}ms)`);
+  }
+
+  async function handleAccountList() {
+    if (!pathname.startsWith('/login/list')) return;
+
+    // 中间阶段：续约/获取登录流程锁
+    if (!(await tryAcquireLock(LOCK_KEYS.LOGIN_FLOW, LOGIN_FLOW_TTL))) {
+      log('登录流程被其他 Tab 占用，本 Tab 跳过账号列表');
+      return;
+    }
+
+    const config = getConfig();
+    log('检测到新版账号列表页，准备搜索账号 ID:', config.accountId);
+
+    try {
+      const searchInput = await waitForElement('#search');
+      await sleep(500);
+
+      // 页面只监听 keypress(keyCode=13) 触发搜索，构造事件时必须显式带上 keyCode
+      searchInput.value = config.accountId;
+      searchInput.dispatchEvent(
+        new KeyboardEvent('keypress', {
+          key: 'Enter',
+          keyCode: 13,
+          which: 13,
+          bubbles: true,
+        })
+      );
+      log('已触发账号搜索');
+
+      const row = await waitForAccountRow(config.accountId);
+
+      // 页面默认 redirect_target=blank 时 login() 走 window.open，
+      // 而合成点击没有用户手势会被弹窗拦截，这里改为 self 用本标签页跳转
+      const redirectTarget = document.getElementById('redirectTarget');
+      if (redirectTarget && redirectTarget.value !== 'self') {
+        log(`redirectTarget=${redirectTarget.value}，改为 self 使用本标签页跳转`);
+        redirectTarget.value = 'self';
+      }
+
+      row.click();
+      log('已点击目标账号，等待跳转');
+    } catch (e) {
+      log('新版账号列表登录失败:', e.message);
+    }
+  }
+
+  /** 登录态失效时 SSO 中转页只返回一段 JSON 文本，页面里没有任何可交互元素 */
+  function isSSOSessionExpired() {
+    const text = ((document.body && document.body.innerText) || '').trim();
+    return text.startsWith('{') && /"code"\s*:/.test(text);
+  }
+
+  /** 登录态失效后带着原始回调参数回到 hub，重新走 QQ 登录 */
+  function restartFromHub() {
+    const params = new URLSearchParams(location.search);
+    if (!params.get('sso_redirect_uri') || !params.get('service_tag')) {
+      log('缺少 sso_redirect_uri / service_tag，无法重新发起登录');
+      return;
+    }
+    const hubUrl = `https://${hostname}/login/hub${location.search}`;
+    log('SSO 登录态已失效，返回 hub 重新登录:', hubUrl);
+    window.location.href = hubUrl;
   }
 
   // 阶段 5：已登录检测
@@ -736,8 +825,12 @@
       await handleHuxuanHome();
       setupAutoCheck();
     } else if (hostname === 'sso.e.qq.com' || hostname === 'tsso.e.qq.com') {
-      if (pathname.startsWith('/login/hub')) {
+      if (isSSOSessionExpired()) {
+        restartFromHub();
+      } else if (pathname.startsWith('/login/hub')) {
         await handleSSOLogin();
+      } else if (pathname.startsWith('/login/list')) {
+        await handleAccountList();
       } else if (pathname.startsWith('/login/sportal')) {
         await handleAccountSelect();
       }
